@@ -1,0 +1,3 @@
+whisper_timestamped
+ffmpeg
+detoxify
