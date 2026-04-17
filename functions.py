@@ -1692,7 +1692,8 @@ class EpisodeList(ctk.CTkScrollableFrame):
         for child in self.ep_frame.winfo_children():
             if hasattr(self, 'load_more_button') and child is self.load_more_button:
                 continue
-            child.destroy()
+            else:
+                child.destroy()
             
         for idx, episode in enumerate(self.episodes):
             try:
@@ -1798,6 +1799,7 @@ class EpisodeList(ctk.CTkScrollableFrame):
         # Repack load more button at the bottom
         if hasattr(self, 'load_more_button'):
             try:
+                self.load_more_button.forget()
                 if self.load_more_button.winfo_exists():
                     self.load_more_button.pack(pady=10)
             except Exception:
