@@ -1,6 +1,6 @@
-# PodAngelEX
+# PodAngelEX 2.0.0
 
-PodAngelEX is a passion project of mine, specifically made for muting inappropriate words and segments in audio
+PodAngelEX is a passion project of mine, specifically made for muting inappropriate words and segments in audio. As of the 2.0.0 update, PodAngelEX now not only has a CLI, but also a GUI. In the GUI, the user can search, subscribe to, and clean podcasts all from one interface, removing the need to download the files, place then in the Input folder, transcribe/clean, and listn. Now you can simply select the episodes you want, hit transcribe, walk away, and come back to fully cleaned audio files.
 
 # How it works
 
@@ -24,15 +24,27 @@ I made PodAngel with the intent of being highly configurable. You can configure:
 
     3. File paths. You can set a file path if you'd like to move PodAngel's 'workspace'. This will move every file/folder that PodAngel relies on to that new path, so if you change it, maybe put it in a fresh folder. 
 
-# Install and How to Run
+# Install and Run CLI
 
 To get started, just:
 
-    1. run pip install -r utils.txt
-    2. run main.py
+    1. Run pip install -r utils.txt
+    2. Run main.py
     3. Complete config init
 
 Then you can put your audio files into the Input folder that should get created, and run the transcription.
+
+# Install and Run GUI
+
+To run the GUI, you:
+
+    1. Run pip install -r utils.txt
+    2. Run gui.py
+    3. Edit config freely in settings tab
+    4. Search for any podcast in the Search tab and double-click to enter album view
+    4.5. Optionally, you can 'subscribe' to podcasts by pressing the '+' icon, and they will show up in your Library tab.
+    5. Once in album view, check off the boxes next to the episodes you wish to transcribe, and press the 'transcribe' button. Please note that closing the application will shut down transcription, although minimizing it will not.
+    Once transcription is finished, your clean files will show up in the Output folder, just like the CLI.
 
 Side note: I do realize there are a few warnings that show up, at least on Mac. As far as I know, these warnings don't refrence anything important, and are more annoying than anything else. If there is a real issue that I failed to notice, please let me know! 
 
@@ -42,5 +54,5 @@ CC0 1.0 Universal - Public Domain
 
 ## AI Declaration
 
-I used some AI to help debug the code, provide commit messages on Github, and to organize the files for package uploading
+I used some AI to help debug the code, provide commit messages on Github, and to organize the files for package uploading. When building the GUI, I tried my best to keep as much work original as possible, but at a few points, I had an agent lend a hand.
 
