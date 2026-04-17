@@ -25,6 +25,7 @@ from io import BytesIO
 import requests
 import podcastparser
 import urllib.request
+import threading
 
 MAX_EPISODES = 20
 
@@ -1820,7 +1821,6 @@ class EpisodeList(ctk.CTkScrollableFrame):
         self.loading = True
         
         # Load more episodes in a separate thread
-        import threading
         def load_thread():
             try:
                 # Load more episodes starting from current offset
