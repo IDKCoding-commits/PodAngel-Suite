@@ -33,4 +33,4 @@ if __name__ == "__main__":
 
         elif normalized_input == "3":
             main_loop = False
-            quit()
+            

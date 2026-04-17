@@ -1,3 +1,4 @@
 whisper_timestamped
 ffmpeg
 detoxify
+podcastparser
