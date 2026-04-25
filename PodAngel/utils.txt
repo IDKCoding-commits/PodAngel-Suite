@@ -1,4 +1,8 @@
 whisper_timestamped
-ffmpeg
+ffmpeg-python
+imageio-ffmpeg
 detoxify
 podcastparser
+customtkinter
+pillow
+requests

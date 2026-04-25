@@ -1,3 +1,12 @@
+def ensure_multiprocessing_safe():
+    """Ensure multiprocessing is safely initialized for macOS/Windows and GUI usage."""
+    import multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+    mp.freeze_support()
+
 import os
 import json
 import re
@@ -809,6 +818,7 @@ def mute_words(input_file: str, output_file: str, words_to_mute: list, segments_
             return False
 #This function is the 'jumpstart' function. Called in main.py, it calls all the functions as they are needed
 def run_program(config_dict: dict, script_dir: Path) -> list | None:
+    ensure_multiprocessing_safe()
     model_size = config_dict["model_size"]
     path = config_dict["file_path"]
     
@@ -835,10 +845,13 @@ def run_program(config_dict: dict, script_dir: Path) -> list | None:
     
     input_path = os.path.join(path, 'Input')
     output_path = os.path.join(path, 'Output')
-    
+
+    # Ensure Output folder exists
+    os.makedirs(output_path, exist_ok=True)
+
     in_files = {f for f in os.listdir(input_path) if os.path.isfile(os.path.join(input_path, f)) and not f.startswith('.')}
     out_files = {f for f in os.listdir(output_path) if os.path.isfile(os.path.join(output_path, f)) and not f.startswith('.')}
-    
+
     working_list = sorted(in_files - out_files)
     file_number = 0
     for items in working_list:
@@ -847,7 +860,7 @@ def run_program(config_dict: dict, script_dir: Path) -> list | None:
         print(f"Processing {file_number} files!")
     except:
         pass
-    
+
     if not working_list:
         print("No files to update")
         return None
@@ -930,7 +943,7 @@ def run_program(config_dict: dict, script_dir: Path) -> list | None:
         raise
 
 def run_program_gui(config_dict: dict, script_dir: Path, status_callback=None, progress_callback=None) -> list | None:
-    """GUI version of run_program that uses callbacks for status updates instead of print statements."""
+    ensure_multiprocessing_safe()
     model_size = config_dict["model_size"]
     path = config_dict["file_path"]
     
@@ -957,16 +970,19 @@ def run_program_gui(config_dict: dict, script_dir: Path, status_callback=None, p
     
     input_path = str(Path(__file__).resolve().parent / "Input")
     output_path = str(Path(__file__).resolve().parent / "Output")
-    
+
+    # Ensure Output folder exists
+    os.makedirs(output_path, exist_ok=True)
+
     in_files = {f for f in os.listdir(input_path) if os.path.isfile(os.path.join(input_path, f)) and not f.startswith('.')}
     out_files = {f for f in os.listdir(output_path) if os.path.isfile(os.path.join(output_path, f)) and not f.startswith('.')}
-    
+
     working_list = sorted(in_files - out_files)
     file_number = len(working_list)
-    
+
     if status_callback:
         status_callback(f"Processing {file_number} files!")
-    
+
     if not working_list:
         if status_callback:
             status_callback("No files to update")
@@ -1908,7 +1924,7 @@ class EpisodeList(ctk.CTkScrollableFrame):
         # Download each selected episode
         if SELECTED_EPISODE_URLS:
             # Ensure Input directory exists inside PodAngel folder
-            input_dir = Path("./PodAngel/Input")
+            input_dir = Path("./Input")
             if input_dir.exists() and not input_dir.is_dir():
                 input_dir.unlink()  # Remove the file if it exists
             input_dir.mkdir(parents=True, exist_ok=True)
