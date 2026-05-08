@@ -36,6 +36,12 @@ import podcastparser
 import urllib.request
 import threading
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 MAX_EPISODES = 20
 
 # Path to library.json
@@ -51,8 +57,271 @@ detox_model = None
 WordToMute = namedtuple('WordToMute', ['word', 'start', 'end'])
 SegmentToMute = namedtuple('SegmentToMute', ['start', 'end'])
 
+
+def detect_gpu_and_device(device_preference: str = "auto"):
+    """
+    Detect available GPU hardware and return the appropriate PyTorch device based on user preference.
+    
+    Args:
+        device_preference: "auto", "gpu", or "cpu"
+    
+    Returns:
+        tuple: (gpu_type, device_string, device_description)
+        - gpu_type: 'nvidia', 'amd', 'apple', or 'none'
+        - device_string: PyTorch device string ('cuda', 'cpu', etc.)
+        - device_description: Human-readable description
+    """
+    if not TORCH_AVAILABLE:
+        return 'none', 'cpu', 'CPU (PyTorch not available)'
+    
+    # Check what hardware is available
+    gpu_available = False
+    gpu_type = 'none'
+    gpu_desc = 'CPU'
+    
+    # Check for NVIDIA CUDA
+    if torch.cuda.is_available():
+        gpu_available = True
+        gpu_type = 'nvidia'
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_desc = f'NVIDIA GPU: {gpu_name}'
+        except:
+            gpu_desc = 'NVIDIA GPU (Unknown model)'
+    
+    # Check for AMD ROCm (only if CUDA not available)
+    elif hasattr(torch, 'hip') and torch.hip.is_available():
+        gpu_available = True
+        gpu_type = 'amd'
+        try:
+            gpu_name = torch.hip.get_device_name(0)
+            gpu_desc = f'AMD GPU (ROCm): {gpu_name}'
+        except:
+            gpu_desc = 'AMD GPU (ROCm)'
+    
+    # Check for Apple MPS (only if others not available)
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        gpu_available = True
+        gpu_type = 'apple'
+        gpu_desc = 'Apple Silicon GPU'
+    
+    # Check system for GPU hardware even if PyTorch doesn't support it
+    if not gpu_available:
+        try:
+            result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
+            gpu_lines = [line for line in result.stdout.split('\n') 
+                        if 'vga' in line.lower() or 'display' in line.lower() or '3d' in line.lower()]
+            
+            for line in gpu_lines:
+                if 'nvidia' in line.lower():
+                    gpu_type = 'nvidia'
+                    gpu_desc = 'NVIDIA GPU detected (CUDA not available)'
+                    break
+                elif 'amd' in line.lower() or 'ati' in line.lower() or 'radeon' in line.lower():
+                    gpu_type = 'amd'
+                    gpu_desc = 'AMD GPU detected (ROCm not available)'
+                    break
+                elif 'intel' in line.lower():
+                    gpu_type = 'intel'
+                    gpu_desc = 'Intel GPU detected'
+                    break
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.CalledProcessError):
+            pass
+    
+    # Apply user preference
+    if device_preference == "cpu":
+        return gpu_type, 'cpu', f'{gpu_desc} (CPU forced)'
+    elif device_preference == "gpu":
+        if gpu_available:
+            device = 'cuda' if gpu_type in ['nvidia', 'amd'] else ('mps' if gpu_type == 'apple' else 'cpu')
+            return gpu_type, device, f'{gpu_desc} (GPU forced)'
+        else:
+            return gpu_type, 'cpu', f'{gpu_desc} (GPU requested but not available)'
+    else:  # auto
+        if gpu_available:
+            device = 'cuda' if gpu_type in ['nvidia', 'amd'] else ('mps' if gpu_type == 'apple' else 'cpu')
+            return gpu_type, device, gpu_desc
+        else:
+            return gpu_type, 'cpu', gpu_desc
+
+
+def get_gpu_memory_info():
+    """Get GPU memory information for the current device."""
+    if not TORCH_AVAILABLE:
+        return None
+    
+    try:
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            allocated_memory = torch.cuda.memory_allocated(device)
+            reserved_memory = torch.cuda.memory_reserved(device)
+            free_memory = total_memory - reserved_memory
+            
+            return {
+                'total': total_memory,
+                'allocated': allocated_memory,
+                'reserved': reserved_memory,
+                'free': free_memory,
+                'free_gb': free_memory / (1024**3),
+                'total_gb': total_memory / (1024**3)
+            }
+        elif hasattr(torch, 'hip') and torch.hip.is_available():
+            # ROCm doesn't have detailed memory info like CUDA
+            # Return basic info if available
+            try:
+                device = torch.device('cuda')  # ROCm uses 'cuda' device string
+                total_memory = torch.cuda.get_device_properties(0).total_memory
+                return {
+                    'total': total_memory,
+                    'allocated': 0,  # Not easily available for ROCm
+                    'reserved': 0,
+                    'free': total_memory,  # Conservative estimate
+                    'free_gb': total_memory / (1024**3),
+                    'total_gb': total_memory / (1024**3)
+                }
+            except:
+                return None
+    except Exception:
+        return None
+    
+    return None
+
+
+def estimate_model_memory_requirements(model_size: str, gpu_type: str = 'unknown'):
+    """Estimate GPU memory requirements for different model sizes."""
+    # Rough estimates based on Whisper model sizes (in GB)
+    base_requirements = {
+        'tiny': 1.0,
+        'base': 1.5,
+        'small': 2.5,
+        'medium': 5.0,
+        'large': 10.0,
+        'turbo': 1.5  # Similar to base but optimized
+    }
+    
+    base_memory = base_requirements.get(model_size, 2.0)
+    
+    # AMD GPUs might need slightly more memory due to different optimizations
+    if gpu_type == 'amd':
+        base_memory *= 1.2
+    
+    # Add buffer for temporary allocations during inference
+    buffer_memory = base_memory * 0.3
+    
+    return base_memory + buffer_memory
+
+
+def determine_optimal_worker_config(model_size: str, device_preference: str, max_workers: int):
+    """Determine optimal worker configuration based on hardware and model requirements."""
+    gpu_type, device, device_desc = detect_gpu_and_device(device_preference)
+    gpu_memory = get_gpu_memory_info()
+    
+    if device == 'cpu' or not gpu_memory:
+        # CPU-only configuration
+        return {
+            'gpu_workers': 0,
+            'cpu_workers': min(max_workers, multiprocessing.cpu_count()),
+            'device': 'cpu',
+            'reason': 'CPU mode or no GPU memory info available'
+        }
+    
+    # GPU available - calculate optimal configuration
+    model_memory_gb = estimate_model_memory_requirements(model_size, gpu_type)
+    available_memory_gb = gpu_memory['free_gb']
+    
+    # Reserve some memory for system and other operations
+    usable_memory_gb = available_memory_gb * 0.8  # Use 80% of available memory
+    
+    if model_memory_gb > usable_memory_gb:
+        # Not enough GPU memory - fall back to CPU
+        return {
+            'gpu_workers': 0,
+            'cpu_workers': min(max_workers, multiprocessing.cpu_count()),
+            'device': 'cpu',
+            'reason': f'Insufficient GPU memory ({available_memory_gb:.1f}GB free, {model_memory_gb:.1f}GB needed)'
+        }
+    
+    # Calculate how many GPU workers we can fit
+    max_gpu_workers = int(usable_memory_gb / model_memory_gb)
+    gpu_workers = min(max_gpu_workers, max_workers)
+    
+    # Calculate remaining slots for CPU workers
+    remaining_slots = max_workers - gpu_workers
+    
+    if gpu_workers >= 1 and remaining_slots > 0:
+        # We have GPU workers and room for CPU workers
+        # Use CPU workers for I/O tasks, but don't exceed available CPU cores
+        cpu_workers = min(remaining_slots, multiprocessing.cpu_count() - 1)
+        cpu_workers = max(cpu_workers, 0)  # Can be 0 if no CPU cores available
+        
+        return {
+            'gpu_workers': gpu_workers,
+            'cpu_workers': cpu_workers,
+            'device': device,
+            'reason': f'GPU memory sufficient ({available_memory_gb:.1f}GB free, using {gpu_workers} GPU + {cpu_workers} CPU workers)'
+        }
+    elif gpu_workers >= 1:
+        # Only GPU workers fit within the user's limit
+        return {
+            'gpu_workers': gpu_workers,
+            'cpu_workers': 0,
+            'device': device,
+            'reason': f'GPU memory sufficient ({available_memory_gb:.1f}GB free, using {gpu_workers} GPU workers only)'
+        }
+    else:
+        # Fall back to CPU
+        return {
+            'gpu_workers': 0,
+            'cpu_workers': min(max_workers, multiprocessing.cpu_count()),
+            'device': 'cpu',
+            'reason': f'Cannot fit GPU model in memory ({available_memory_gb:.1f}GB free, {model_memory_gb:.1f}GB needed)'
+        }
+
+
+def monitor_gpu_memory_during_processing():
+    """Monitor GPU memory usage and provide warnings if getting low."""
+    if not TORCH_AVAILABLE:
+        return
+    
+    try:
+        if torch.cuda.is_available() or (hasattr(torch, 'hip') and torch.hip.is_available()):
+            memory_info = get_gpu_memory_info()
+            if memory_info:
+                free_gb = memory_info['free_gb']
+                total_gb = memory_info['total_gb']
+                used_percent = ((total_gb - free_gb) / total_gb) * 100
+                
+                if free_gb < 1.0:  # Less than 1GB free
+                    print(f"Warning: GPU memory very low ({free_gb:.1f}GB free, {used_percent:.1f}% used)")
+                elif free_gb < 2.0:  # Less than 2GB free
+                    print(f"Notice: GPU memory getting low ({free_gb:.1f}GB free, {used_percent:.1f}% used)")
+    except Exception as e:
+        # Silently ignore monitoring errors
+        pass
+
+
+def handle_gpu_out_of_memory_error(error: Exception, filename: str) -> bool:
+    """Handle GPU out-of-memory errors by attempting recovery."""
+    error_str = str(error).lower()
+    if 'out of memory' in error_str or 'cuda out of memory' in error_str or 'hip out of memory' in error_str:
+        print(f"GPU out of memory error processing {filename}")
+        print("Attempting to clear GPU cache and retry...")
+        
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # For ROCm, try to clear cache if available
+            if hasattr(torch, 'hip') and torch.hip.is_available():
+                torch.cuda.empty_cache()  # ROCm uses cuda cache clearing
+            return True  # Indicate retry is possible
+        except Exception:
+            pass
+    
+    return False  # No retry possible
+
+
 #Used to read specifically config
-def read_config(file_path):
     try:
         with open(file_path, 'r') as f:
             return json.load(f)
@@ -122,6 +391,7 @@ def config_menu(script_dir: Path) -> None:
         "file_path": str(script_dir),
         "worker_count": "1",
         "model_size": "small",
+        "device_preference": "auto",
         "t": 0.5, "st": 0.5, "o": 0.5, "th": 0.5, "i": 0.5, "id": 0.5
     }
     
@@ -143,14 +413,10 @@ def config_menu(script_dir: Path) -> None:
         new_dir = input("Enter path: ").strip()
     else:
         new_dir = str(script_dir)
-    
-    # Ensure absolute path (relative paths are relative to script_dir, not cwd)
-    if not os.path.isabs(new_dir):
-        new_dir = str(script_dir / new_dir)
-    
+
     config_data["file_path"] = new_dir
     write_config(str(script_dir / "config.json"), config_data)
-    
+
     while True:
         try:
             worker_count = input("\nNumber of workers: ").strip()
@@ -162,7 +428,18 @@ def config_menu(script_dir: Path) -> None:
                 break
         except ValueError:
             print("Please enter a valid number")
-    
+
+    while True:
+        use_gpu = input("\nUse GPU if available? (Y/n): ").lower().strip()
+        if use_gpu in ["", "y", "yes"]:
+            config_data["device_preference"] = "auto"
+            break
+        elif use_gpu in ["n", "no"]:
+            config_data["device_preference"] = "cpu"
+            break
+        else:
+            print("Please enter Y or n")
+
     if input("\nConfigure toxicity thresholds? (y/N): ").lower().strip() == "y":
         print("\nSet thresholds (category-value, e.g., st-0.5):\n"
               "t=toxicity, st=severe, o=obscene, th=threats, i=insults, id=identity")
@@ -197,8 +474,9 @@ DEFAULT_CONFIG = {
     "t": 0.5,
     "th": 0.5,
     "worker_count": "1",
+    "device_preference": "auto",
 }
-CONFIG_ORDER = ["file_path", "i", "id", "model_size", "o", "st", "t", "th", "worker_count"]
+CONFIG_ORDER = ["file_path", "i", "id", "model_size", "o", "st", "t", "th", "worker_count", "device_preference"]
 
 
 def load_app_config(config_path: Path | str | None = None) -> dict:
@@ -294,12 +572,33 @@ class SettingsEntry(ctk.CTkFrame):
         model_select.grid(row=2, column=1, padx=20, pady=(10, 5), sticky="ew")
         self.field_widgets["model_size"] = model_select
 
+        device_label = ctk.CTkLabel(content_frame, text="Use GPU if available:", anchor="w")
+        device_label.grid(row=3, column=0, padx=20, pady=(10, 5), sticky="w")
+
+        device_pref_var = ctk.IntVar(value=1 if self._config_data.get("device_preference", "auto") != "cpu" else 0)
+        device_switch = ctk.CTkSwitch(
+            content_frame,
+            text="",
+            command=self.update_gpu_label,
+            variable=device_pref_var,
+            onvalue=1,
+            offvalue=0,
+            width=50
+        )
+        device_switch.grid(row=3, column=1, padx=20, pady=(10, 5), sticky="w")
+        self.field_widgets["device_preference"] = device_pref_var
+
         self.vram_label = ctk.CTkLabel(content_frame, text="Estimated VRAM usage: -- GB", anchor="w")
-        self.vram_label.grid(row=3, column=0, columnspan=2, padx=20, pady=(5, 10), sticky="w")
+        self.vram_label.grid(row=4, column=0, columnspan=2, padx=20, pady=(5, 10), sticky="w")
         self.update_vram_label()
 
+        # Add GPU detection info
+        self.gpu_label = ctk.CTkLabel(content_frame, text="Detected hardware: --", anchor="w")
+        self.gpu_label.grid(row=5, column=0, columnspan=2, padx=20, pady=(5, 10), sticky="w")
+        self.update_gpu_label()
+
         threshold_frame = ctk.CTkFrame(content_frame, fg_color="#1f1f1f")
-        threshold_frame.grid(row=4, column=0, columnspan=2, padx=20, pady=(10, 10), sticky="ew")
+        threshold_frame.grid(row=6, column=0, columnspan=2, padx=20, pady=(10, 10), sticky="ew")
         threshold_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         threshold_keys = ["t", "st", "o", "th", "i", "id"]
@@ -327,34 +626,11 @@ class SettingsEntry(ctk.CTkFrame):
             entry.grid(row=row * 2 + 1, column=col, padx=10, pady=(5, 10), sticky="ew")
             self.field_widgets[key] = entry
 
-        threshold_keys = ["t", "st", "o", "th", "i", "id"]
-        threshold_titles = {
-            "t": "toxicity",
-            "st": "severe",
-            "o": "obscene",
-            "th": "threats",
-            "i": "insults",
-            "id": "identity",
-        }
-        for index, key in enumerate(threshold_keys):
-            row = index // 3
-            col = index % 3
-            label = ctk.CTkLabel(threshold_frame, text=f"{threshold_titles[key]}:", anchor="w")
-            label.grid(row=row * 2, column=col, padx=10, pady=(10, 0), sticky="w")
-            entry = ctk.CTkEntry(
-                threshold_frame,
-                placeholder_text="0.0 - 1.0",
-                width=100
-            )
-            entry.insert(0, str(self._config_data.get(key, 0.5)))
-            entry.grid(row=row * 2 + 1, column=col, padx=10, pady=(5, 10), sticky="ew")
-            self.field_widgets[key] = entry
-
         self.error_label = ctk.CTkLabel(self, text="", text_color="#ff5555", anchor="w")
-        self.error_label.grid(row=6, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="w")
+        self.error_label.grid(row=8, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="w")
 
         button_frame = ctk.CTkFrame(self, fg_color="transparent")
-        button_frame.grid(row=7, column=0, columnspan=2, padx=20, pady=(5, 20), sticky="ew")
+        button_frame.grid(row=9, column=0, columnspan=2, padx=20, pady=(5, 20), sticky="ew")
         button_frame.grid_columnconfigure(0, weight=1)
         button_frame.grid_columnconfigure(1, weight=1)
 
@@ -383,11 +659,19 @@ class SettingsEntry(ctk.CTkFrame):
         total = workers * vram_per_model
         self.vram_label.configure(text=f"Estimated VRAM usage: {total} GB ({workers} worker(s) × {vram_per_model}GB)")
 
+    def update_gpu_label(self, *args):
+        pref_value = self.field_widgets["device_preference"].get()
+        device_preference = "auto" if pref_value == 1 else "cpu"
+        gpu_type, device, device_desc = detect_gpu_and_device(device_preference)
+        self.gpu_label.configure(text=f"Detected hardware: {device_desc}")
+
     def _gather_values(self) -> dict:
+        pref_value = self.field_widgets["device_preference"].get()
         config = {
             "file_path": self.field_widgets["file_path"].get().strip() or DEFAULT_CONFIG["file_path"],
             "worker_count": self.field_widgets["worker_count"].get().strip() or DEFAULT_CONFIG["worker_count"],
             "model_size": self.field_widgets["model_size"].get() or DEFAULT_CONFIG["model_size"],
+            "device_preference": "auto" if pref_value == 1 else "cpu",
         }
         for key in ["t", "st", "o", "th", "i", "id"]:
             raw = self.field_widgets[key].get().strip()
@@ -417,13 +701,18 @@ class SettingsEntry(ctk.CTkFrame):
         self._config_data = load_app_config(self.config_path)
         for key, widget in self.field_widgets.items():
             value = self._config_data.get(key, DEFAULT_CONFIG[key])
-            if isinstance(widget, ctk.CTkOptionMenu):
-                widget.set(value)
+            if hasattr(widget, "set"):
+                if key == "device_preference":
+                    widget.set(1 if value != "cpu" else 0)
+                else:
+                    widget.set(value)
             else:
                 widget.delete(0, "end")
                 widget.insert(0, str(value))
         self.error_label.configure(text="Settings reloaded.", text_color="#8f8")
         self.update_vram_label()
+        self.update_gpu_label()
+        self.update_gpu_label()
 
     def _show_config_created_notification(self):
         """Show a popup notification when config is first created."""
@@ -537,8 +826,20 @@ def get_audio_duration(file_path: str) -> float | None:
     
 #Initializes the worker model to be used later
 
-def worker_initializer(model_size: str) -> None:
+def worker_initializer(model_size: str, device: str = 'cpu', worker_type: str = 'cpu') -> None:
     global worker_model
+    
+    # For GPU workers, check memory before loading
+    if device != 'cpu' and worker_type == 'gpu':
+        gpu_memory = get_gpu_memory_info()
+        if gpu_memory:
+            model_memory_gb = estimate_model_memory_requirements(model_size, 'amd' if hasattr(torch, 'hip') and torch.hip.is_available() else 'nvidia')
+            if gpu_memory['free_gb'] < model_memory_gb:
+                print(f"Warning: Insufficient GPU memory in worker ({gpu_memory['free_gb']:.1f}GB free, {model_memory_gb:.1f}GB needed)")
+                print("Falling back to CPU for this worker")
+                device = 'cpu'
+                worker_type = 'cpu'
+    
     # Monkey patch whisper to use the full ffmpeg path
     import imageio_ffmpeg
     import whisper.audio
@@ -573,7 +874,25 @@ def worker_initializer(model_size: str) -> None:
     # Replace the function
     whisper.audio.load_audio = patched_load_audio
     
-    worker_model = whisper_timestamped.load_model(model_size)
+    # Try to load model with device specification
+    try:
+        # Check if whisper_timestamped supports device parameter
+        import inspect
+        sig = inspect.signature(whisper_timestamped.load_model)
+        if 'device' in sig.parameters:
+            worker_model = whisper_timestamped.load_model(model_size, device=device)
+            print(f"Loaded Whisper model '{model_size}' on device: {device} (worker type: {worker_type})")
+        else:
+            worker_model = whisper_timestamped.load_model(model_size)
+            print(f"Loaded Whisper model '{model_size}' (device parameter not supported, using default, worker type: {worker_type})")
+    except Exception as e:
+        print(f"Warning: Could not specify device for Whisper model: {e}")
+        try:
+            worker_model = whisper_timestamped.load_model(model_size)
+            print(f"Loaded Whisper model '{model_size}' (fallback to default device, worker type: {worker_type})")
+        except Exception as e2:
+            print(f"Critical error: Could not load Whisper model: {e2}")
+            worker_model = None
 
 #Boots the workers, hands them the filename and path, and starts transcribing
 
@@ -583,13 +902,28 @@ def process_file(filename: str, input_path: str) -> dict:
     # Ensure input_path is absolute
     input_path = os.path.abspath(input_path)
     file_path = os.path.join(input_path, filename)
+    
+    # Monitor GPU memory at start of processing
+    monitor_gpu_memory_during_processing()
+    
     try:
         transcribed_file = whisper_timestamped.transcribe(worker_model, file_path)
         return transcribed_file
     except Exception as e:
-        print(f"Error in whisper_timestamped.transcribe: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
+        # Check if this is a GPU out-of-memory error
+        if handle_gpu_out_of_memory_error(e, filename):
+            # Try one more time after clearing cache
+            try:
+                transcribed_file = whisper_timestamped.transcribe(worker_model, file_path)
+                return transcribed_file
+            except Exception as e2:
+                print(f"Error in whisper_timestamped.transcribe (retry failed): {e2}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"Error in whisper_timestamped.transcribe: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
         raise
 
 #Cleans up the workers
@@ -614,8 +948,13 @@ def signal_handler(signum, frame):
         cleanup_queue()
     except Exception:
         pass
-    cleanup_workers()
-    sys.exit(0)
+    try:
+        cleanup_workers()
+    except Exception:
+        pass
+    # Use os._exit() for immediate termination to avoid threading issues
+    import os
+    os._exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 try:
@@ -837,11 +1176,29 @@ def run_program(config_dict: dict, script_dir: Path) -> list | None:
         config_dict["th"]
     ]
     
+    # Detect GPU and device
+    device_preference = config_dict.get("device_preference", "auto")
+    gpu_type, device, device_desc = detect_gpu_and_device(device_preference)
+    print(f"Detected hardware: {device_desc}")
+    
     with open(str(script_dir / "bad_words.pkl"), 'rb') as file:
         bad_words = pickle.load(file)
     
     global detox_model
-    detox_model = Detoxify('original')
+    # Try to load Detoxify with device specification
+    try:
+        import inspect
+        sig = inspect.signature(Detoxify.__init__)
+        if 'device' in sig.parameters:
+            detox_model = Detoxify('original', device=device)
+            print(f"Loaded Detoxify model on device: {device}")
+        else:
+            detox_model = Detoxify('original')
+            print("Loaded Detoxify model (device parameter not supported, using default)")
+    except Exception as e:
+        print(f"Warning: Could not specify device for Detoxify model: {e}")
+        detox_model = Detoxify('original')
+        print("Loaded Detoxify model (fallback to default device)")
     
     input_path = os.path.join(path, 'Input')
     output_path = os.path.join(path, 'Output')
@@ -865,11 +1222,23 @@ def run_program(config_dict: dict, script_dir: Path) -> list | None:
         print("No files to update")
         return None
     
+    # Determine optimal worker configuration
+    worker_config = determine_optimal_worker_config(model_size, device_preference, worker_counts)
+    
+    print(f"Worker configuration: {worker_config['gpu_workers']} GPU + {worker_config['cpu_workers']} CPU workers")
+    print(f"Reason: {worker_config['reason']}")
+    
+    # Use the determined device and worker counts
+    device = worker_config['device']
+    total_workers = worker_config['gpu_workers'] + worker_config['cpu_workers']
+    
     global global_pool
     results = []
     
     try:
-        with multiprocessing.Pool(processes=worker_counts, initializer=worker_initializer, initargs=(model_size,)) as pool:
+        # Create worker pool with optimal configuration
+        worker_type = 'gpu' if worker_config['gpu_workers'] > 0 else 'cpu'
+        with multiprocessing.Pool(processes=total_workers, initializer=worker_initializer, initargs=(model_size, device, worker_type)) as pool:
             global_pool = pool
             
             job_to_filename = {}
@@ -880,9 +1249,11 @@ def run_program(config_dict: dict, script_dir: Path) -> list | None:
             pending = list(job_to_filename.keys())
             processed_files = {"success": [], "failed": []}
             while pending:
+                completed_this_round = 0
                 for async_result in list(pending):
                     if async_result.ready():
                         filename = job_to_filename[async_result]
+                        completed_this_round += 1
                         try:
                             transcribed_file = async_result.get()
                             results.append(transcribed_file)
@@ -909,6 +1280,11 @@ def run_program(config_dict: dict, script_dir: Path) -> list | None:
                             print(f"Error processing {filename}: {e}")
                             processed_files["failed"].append(filename)
                         pending.remove(async_result)
+                
+                # Monitor GPU memory periodically
+                if completed_this_round > 0:
+                    monitor_gpu_memory_during_processing()
+                
                 if pending:
                     time.sleep(0.1)
                 
@@ -962,11 +1338,34 @@ def run_program_gui(config_dict: dict, script_dir: Path, status_callback=None, p
         config_dict["th"]
     ]
     
+    # Detect GPU and device
+    device_preference = config_dict.get("device_preference", "auto")
+    gpu_type, device, device_desc = detect_gpu_and_device(device_preference)
+    if status_callback:
+        status_callback(f"Detected hardware: {device_desc}")
+    
     with open(str(script_dir / "bad_words.pkl"), 'rb') as file:
         bad_words = pickle.load(file)
     
     global detox_model
-    detox_model = Detoxify('original')
+    # Try to load Detoxify with device specification
+    try:
+        import inspect
+        sig = inspect.signature(Detoxify.__init__)
+        if 'device' in sig.parameters:
+            detox_model = Detoxify('original', device=device)
+            if status_callback:
+                status_callback(f"Loaded Detoxify model on device: {device}")
+        else:
+            detox_model = Detoxify('original')
+            if status_callback:
+                status_callback("Loaded Detoxify model (device parameter not supported, using default)")
+    except Exception as e:
+        if status_callback:
+            status_callback(f"Warning: Could not specify device for Detoxify model: {e}")
+        detox_model = Detoxify('original')
+        if status_callback:
+            status_callback("Loaded Detoxify model (fallback to default device)")
     
     input_path = str(Path(__file__).resolve().parent / "Input")
     output_path = str(Path(__file__).resolve().parent / "Output")
@@ -988,11 +1387,23 @@ def run_program_gui(config_dict: dict, script_dir: Path, status_callback=None, p
             status_callback("No files to update")
         return None
     
-    global global_pool
+    # Determine optimal worker configuration
+    worker_config = determine_optimal_worker_config(model_size, device_preference, worker_counts)
+    
+    if status_callback:
+        status_callback(f"Worker configuration: {worker_config['gpu_workers']} GPU + {worker_config['cpu_workers']} CPU workers")
+        status_callback(f"Reason: {worker_config['reason']}")
+    
+    # Use the determined device and worker counts
+    device = worker_config['device']
+    total_workers = worker_config['gpu_workers'] + worker_config['cpu_workers']
+    
     results = []
     
     try:
-        with multiprocessing.Pool(processes=worker_counts, initializer=worker_initializer, initargs=(model_size,)) as pool:
+        # Create worker pool with optimal configuration
+        worker_type = 'gpu' if worker_config['gpu_workers'] > 0 else 'cpu'
+        with multiprocessing.Pool(processes=total_workers, initializer=worker_initializer, initargs=(model_size, device, worker_type)) as pool:
             global_pool = pool
             
             job_to_filename = {}
@@ -1005,10 +1416,12 @@ def run_program_gui(config_dict: dict, script_dir: Path, status_callback=None, p
             completed_count = 0
             
             while pending:
+                completed_this_round = 0
                 for async_result in list(pending):
                     if async_result.ready():
                         filename = job_to_filename[async_result]
                         completed_count += 1
+                        completed_this_round += 1
                         try:
                             transcribed_file = async_result.get()
                             results.append(transcribed_file)
@@ -1046,6 +1459,10 @@ def run_program_gui(config_dict: dict, script_dir: Path, status_callback=None, p
                         # Update progress
                         if progress_callback:
                             progress_callback(completed_count, file_number)
+                
+                # Monitor GPU memory periodically
+                if completed_this_round > 0:
+                    monitor_gpu_memory_during_processing()
                 
                 if pending:
                     time.sleep(0.1)
