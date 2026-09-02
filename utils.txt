@@ -1,8 +1,16 @@
-whisper_timestamped
-ffmpeg-python
-imageio-ffmpeg
-detoxify
-podcastparser
-customtkinter
-pillow
-requests
+# Speech recognition
+whisper-timestamped==1.15.9
+openai-whisper==20250625
+
+# Content moderation
+# Detoxify supplies its transformers and torch dependencies.
+detoxify==0.5.2
+
+# Audio probing/processing
+imageio-ffmpeg==0.6.0
+
+# Podcast discovery and GUI
+podcastparser==0.6.11
+customtkinter==5.2.2
+Pillow==12.2.0
+requests==2.33.1
